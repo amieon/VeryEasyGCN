@@ -3,6 +3,14 @@
 #include <vector>
 #include <cassert>
 
+// CSR Matrix Definition
+template<typename T>
+struct CSRMatrix {
+    int rows, cols;
+    std::vector<int> row_ptr;
+    std::vector<int> col_idx;
+    std::vector<T> values;
+};
 
 template<typename T>
 class Matrix {
