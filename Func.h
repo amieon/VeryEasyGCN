@@ -71,7 +71,16 @@ Matrix<T> LossGrad(const Matrix<T>& pred, const Matrix<T>& label) {
 
     return grad;
 }
+template<typename T>
+void random_inti_Matrix(Matrix<T>& A){
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<T> dist(0.0f, 1.0f);
 
+    for (int i = 0; i < A.rows; ++i)
+        for (int j = 0; j < A.cols; ++j)
+            A.set(i,j,dist(gen));
+}
 
 template<typename T>
 void read_Graph(Matrix<T>& A){
