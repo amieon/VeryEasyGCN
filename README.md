@@ -98,6 +98,7 @@ void checkModeSwitch()
 ## 3. GCN 层实现
 
 GCN 的核心公式：
+
 $$
 H = \sigma(\hat{A}XW)
 $$
@@ -128,6 +129,7 @@ return outputH = relu(Z);
 ## 4. 邻接矩阵归一化
 
 项目中实现了标准 GCN 的邻接矩阵归一化：
+
 $$
 \hat{A} = D^{-\frac{1}{2}}(A+I)D^{-\frac{1}{2}}
 $$
@@ -171,6 +173,7 @@ reluDerivative()
 ## 6. 损失函数
 
 使用均方误差（MSE）：
+
 $$
 MSE = \frac{1}{nc}\sum_{i=1}^{n}\sum_{j=1}^{c}(y_{ij}-\hat{y}_{ij})^2
 $$
@@ -196,9 +199,11 @@ LossGrad()
 ## 1. 前向传播
 
 GCN 的每一层可以表示为邻居节点特征的聚合与非线性变换。假设第 $l$ 层的输入为 $H^{(l)}$，权重矩阵为 $W^{(l)}$，归一化后的邻接矩阵为 $\tilde{A}$，则前向传播公式为：
+
 $$
 H^{(l+1)} = \sigma(\tilde{A} H^{(l)} W^{(l)})
 $$
+
 其中：
 
 - $H^{(0)} = X$ （输入特征矩阵）
@@ -208,9 +213,11 @@ $$
 ## 2. 损失函数
 
 我们使用均方误差（MSE）作为损失函数（也可推广至交叉熵）：
+
 $$
  E = \frac{1}{2} \sum_{k} (y_k - h_k)^2 = \frac{1}{2} | Y - H^{(L)} |_F^2 
 $$
+
 
 
 其中 $Y$ 是真实标签，$H^{(L)}$ 是网络输出。
@@ -224,12 +231,15 @@ $$
 首先定义输出层的误差项（Error Term）。令 $Z^{(l)} = \tilde{A} H^{(l)} W^{(l)}$ 为激活前的输入。
 
 对于输出层（假设为第 $n$ 层），其梯度计算如下：
+
 $$
 \frac{\partial E}{\partial W^{(n)}} = \frac{\partial E}{\partial Z^{(n)}} \cdot \frac{\partial Z^{(n)}}{\partial W^{(n)}}
 $$
 
 
+
 其中，输出层的误差项 $\delta^{(n)} = \frac{\partial E}{\partial Z^{(n)}}$ 可以展开为：
+
 $$
 \delta^{(n)} = \frac{\partial E}{\partial H^{(n)}} \odot \sigma'(Z^{(n)}) = (H^{(n)} - Y) \odot \sigma'(Z^{(n)}) 
 $$
@@ -240,6 +250,7 @@ $$
 ### 3.2 隐藏层梯度 (链式法则)
 
 对于任意隐藏层 $l$，误差需要从后一层 $l+1$ 反向传播回来。根据链式法则：
+
 $$
 \frac{\partial E}{\partial H^{(l)}} = \frac{\partial E}{\partial Z^{(l+1)}} \cdot \frac{\partial Z^{(l+1)}}{\partial H^{(l)}} = (\delta^{(l+1)})^T \cdot \tilde{A} W^{(l+1)T}
 $$
@@ -248,6 +259,7 @@ $$
 *注：这里涉及到矩阵求导的维度匹配，$\tilde{A}$ 和 $W$ 需要转置以保持维度一致。*
 
 因此，第 $l$ 层的误差项 $\delta^{(l)}$ 递推公式为：
+
 $$
 \delta^{(l)} = (\delta^{(l+1)} W^{(l+1)T} \tilde{A}^T) \odot \sigma'(Z^{(l)}) 
 $$
@@ -256,10 +268,14 @@ $$
 ### 3.3 权重更新公式
 
 一旦求得误差项 $\delta^{(l)}$，第 $l$ 层的权重梯度即可表示为：
+
 $$
 \nabla_{W^{(l)}} E = \frac{\partial E}{\partial W^{(l)}} = H^{(l)T} \tilde{A}^T \delta^{(l)}
 $$
+
+
 最终的权重更新（使用梯度下降）为：
+
 $$
 W^{(l)} \leftarrow W^{(l)} - \alpha \cdot (H^{(l)T} \tilde{A}^T \delta^{(l)}) 
 $$
@@ -269,9 +285,27 @@ $$
 
 为了便于编程实现，我们将上述推导总结为以下迭代步骤：
 
-1. **计算输出误差：** $$ \delta^{(L)} = (H^{(L)} - Y) \odot \sigma'(Z^{(L)}) $$
-2. **反向传播误差 ($l = L-1, \dots, 1$)：** $$ \delta^{(l)} = (\delta^{(l+1)} W^{(l+1)T} \tilde{A}^T) \odot \sigma'(Z^{(l)}) $$
-3. **计算梯度并更新：** $$ \frac{\partial E}{\partial W^{(l)}} = H^{(l)T} \tilde{A}^T \delta^{(l)} $$ $$ W^{(l)} = W^{(l)} - \alpha \frac{\partial E}{\partial W^{(l)}} $$
+1. **计算输出误差：** 
+
+$$
+\delta^{(L)} = (H^{(L)} - Y) \odot \sigma'(Z^{(L)}) 
+$$
+
+2. **反向传播误差 ($l = L-1, \dots, 1$)：** 
+
+$$
+\delta^{(l)} = (\delta^{(l+1)} W^{(l+1)T} \tilde{A}^T) \odot \sigma'(Z^{(l)}) 
+$$
+
+3. **计算梯度并更新：** 
+
+$$ 
+\frac{\partial E}{\partial W^{(l)}} = H^{(l)T} \tilde{A}^T \delta^{(l)} 
+$$ 
+
+$$ 
+W^{(l)} = W^{(l)} - \alpha \frac{\partial E}{\partial W^{(l)}} 
+$$
 
 ## 5. 反向展示PPT可以看
 
