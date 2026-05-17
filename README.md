@@ -98,8 +98,10 @@ void checkModeSwitch()
 ## 3. GCN 层实现
 
 GCN 的核心公式：
+$$
+H = \sigma(\hat{A}XW)
+$$
 
-genui{"math_block_widget_always_prefetch_v2":{"content":"H = \sigma(\hat{A} X W)"}}
 
 其中：
 
@@ -126,8 +128,10 @@ return outputH = relu(Z);
 ## 4. 邻接矩阵归一化
 
 项目中实现了标准 GCN 的邻接矩阵归一化：
+$$
+\hat{A} = D^{-\frac{1}{2}}(A+I)D^{-\frac{1}{2}}
+$$
 
-genui{"math_block_widget_always_prefetch_v2":{"content":"\hat{A} = D^{-\frac{1}{2}} (A + I) D^{-\frac{1}{2}}"}}
 
 作用：
 
@@ -149,7 +153,11 @@ normalizeAdjacency()
 
 ### ReLU
 
-genui{"math_block_widget_always_prefetch_v2":{"content":"f(x)=\max(0,x)"}}
+$$
+f(x)=\max(0,x)
+$$
+
+
 
 对应函数：
 
@@ -163,8 +171,10 @@ reluDerivative()
 ## 6. 损失函数
 
 使用均方误差（MSE）：
+$$
+MSE = \frac{1}{nc}\sum_{i=1}^{n}\sum_{j=1}^{c}(y_{ij}-\hat{y}_{ij})^2
+$$
 
-genui{"math_block_widget_always_prefetch_v2":{"content":"MSE = \frac{1}{nc}\sum_{i=1}^{n}\sum_{j=1}^{c}(y_{ij}-\hat{y}_{ij})^2"}}
 
 实现函数：
 
@@ -386,6 +396,13 @@ Thomas Kipf & Max Welling:
 - PyTorch Geometric
 - Deep Learning（Ian Goodfellow）
 - 图神经网络：基础与前沿
+
+------
+
+# 作者
+
+- 聂宇航
+- 学号：23170001072
 
 ------
 
