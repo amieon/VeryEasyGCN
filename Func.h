@@ -153,3 +153,38 @@ double accuracy_masked(const DenseMatrix<T>& logits, const std::vector<int>& y,
         }
     return total ? double(correct) / total : 0.0;
 }
+
+// ===========================================================================
+// Phase 4：Inverted Dropout
+//   训练时按概率 p 置零，保留的元素乘 1/(1-p)（保持期望不变）；
+//   缓存 mask，反向用同一 mask 缩放梯度。推理时为恒等。
+// ===========================================================================
+template<typename T>
+struct Dropout {
+    T p;
+    DenseMatrix<T> mask;  // 存 mask*scale（0 或 1/(1-p)）
+
+    explicit Dropout(T p_ = T(0)) : p(p_) {}
+
+    DenseMatrix<T> forward(const DenseMatrix<T>& X, bool training) {
+        if (!training || p <= T(0)) { mask = DenseMatrix<T>(); return X; }
+        T scale = T(1) / (T(1) - p);
+        mask = DenseMatrix<T>(X.rows, X.cols);
+        DenseMatrix<T> out(X.rows, X.cols);
+        std::uniform_real_distribution<T> u(T(0), T(1));
+        for (size_t i = 0; i < X.data.size(); ++i) {
+            T keep = (u(global_rng()) < p) ? T(0) : scale;
+            mask.data[i] = keep;
+            out.data[i] = X.data[i] * keep;
+        }
+        return out;
+    }
+
+    DenseMatrix<T> backward(const DenseMatrix<T>& dY) {
+        if (mask.data.empty()) return dY;  // 未应用（推理或 p=0）
+        DenseMatrix<T> dX(dY.rows, dY.cols);
+        for (size_t i = 0; i < dY.data.size(); ++i)
+            dX.data[i] = dY.data[i] * mask.data[i];
+        return dX;
+    }
+};
