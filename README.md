@@ -1,545 +1,205 @@
-# 基于 CSR 稀疏矩阵的图卷积神经网络（GCN）实现
+# VeryEasyGCN — 从零实现的稀疏图卷积网络（C++）
 
-## 项目简介
+用纯 C++（不依赖任何深度学习框架）从零实现的两层图卷积网络（GCN）。项目的重点不在"实现一个 GCN"——而在把它当**系统问题**来做：自己写稀疏算子、量它的性能、用数值梯度检验证明反向传播正确、并把核心 kernel 做多核并行。
 
-本项目使用 C++ 从零实现了一个简化版图卷积神经网络（Graph Convolutional Network, GCN）框架，重点完成了：
+核心亮点：
 
-- 基于 CSR（Compressed Sparse Row）格式的稀疏矩阵实现
-- 稀疏矩阵与稠密矩阵的自动切换
-- GCN 前向传播与反向传播
-- ReLU 激活函数
-- MSE 损失函数
-- 基于梯度下降的参数更新
-- 图邻接矩阵归一化
-
-该项目主要用于学习：
-
-- 图神经网络（GNN / GCN）基本原理
-- 稀疏矩阵存储与运算
-- 神经网络反向传播机制
-- C++ 模板编程
-- 深度学习底层实现思想
+- **真正高效的 CSR-SpMM kernel**：稀疏邻接矩阵 × 稠密特征，按非零做顺序访存的 AXPY，比"把稀疏矩阵当稠密做 GEMM"在稀疏图上快约 **80×**（开销随非零数 nnz 增长，而非 n²）。
+- **扁平连续内存**：`DenseMatrix` 用单块 row-major 缓冲；稀疏/稠密是编译期已知的静态类型，无运行时切换开销。
+- **数值梯度检验**：解析梯度 vs 中心差分，最大相对误差 **3e-9**，证明前向/反向实现正确。
+- **完整训练栈**：softmax + 交叉熵、masked 训练/验证/测试、AdamW、Dropout，在 Cora 节点分类上达到与原论文同量级的准确率。
+- **OpenMP 行级并行 SpMM**：并行结果与串行逐位一致。
 
 ------
 
-# 项目结构
+## 项目结构
 
-```text
+```
 .
-├── main.cpp          # 主函数，训练流程入口
-├── Matrix.h          # 稀疏/稠密矩阵类实现（CSR核心）
-├── Graph.h           # 图结构定义
-├── GCNLayer.h        # GCN层实现
-├── Func.h            # 激活函数、损失函数、图归一化等工具函数
-└── 综合实验--图卷积神经网络.docx
+├── Tensor.h        # 核心：DenseMatrix（扁平 row-major）+ CSR（真正的 SpMM kernel）
+├── Func.h          # 激活/损失、softmax、交叉熵、初始化、Dropout、图归一化
+├── GCNLayer.h      # GCN 层：前向 / 反向 / 参数更新（可选 ReLU / Identity 激活）
+├── Optim.h         # AdamW 优化器
+├── Dataset.h       # Cora 加载器 + 合成数据集（SBM / Cora-like）
+├── main.cpp        # teacher–student 训练（验证训练链路）
+├── train_cora.cpp  # Cora 节点分类主程序
+├── gradcheck.cpp   # 数值梯度检验
+├── bench_spmm.cpp  # SpMM 性能基准（新 vs 旧 vs 稠密）
+├── bench_omp.cpp   # OpenMP 多核扩展性基准
+└── Matrix.h        # 旧实现（已退役，仅 bench_spmm 留作对照基线）
 ```
 
 ------
 
-# 核心功能说明
+## 架构设计
 
-## 1. CSR 稀疏矩阵实现
+GCN 的数据流里，归一化邻接矩阵 Â 恒为稀疏、节点特征 X 与权重 W 恒为稠密——这是编译期就确定的事实。因此项目把存储拆成两个静态类型，而非用一个会在运行时按密度来回切换的矩阵类：
 
-项目中的 `Matrix` 类支持两种模式：
+- **`DenseMatrix<T>`**：单块连续 `std::vector<T>`，row-major。所有稠密 GEMM（`matmul` / `matmul_AtB` / `matmul_ABt`）走裸指针、按行连续访存。
+- **`CSR<T>`**：标准压缩稀疏行（`row_ptr` / `col_idx` / `values`），核心方法是 `spmm`。
+
+### 核心算子：CSR-SpMM
+
+`C = Â · B`（Â 稀疏 m×k，B 稠密 k×n）的实现是教科书写法——遍历每个非零，对 B 的对应稠密行做一次 AXPY 累加到 C 的行上，全程顺序访存：
 
 ```cpp
-enum class Mode {
-    SPARSE,
-    DENSE
-};
+for (int i = 0; i < rows; ++i) {
+    T* crow = C.row_ptr(i);
+    for (int idx = row_ptr[i]; idx < row_ptr[i+1]; ++idx) {
+        const T a = values[idx];
+        const T* brow = B.row_ptr(col_idx[idx]);
+        for (int j = 0; j < N; ++j)
+            crow[j] += a * brow[j];        // AXPY
+    }
+}
 ```
 
-其中：
-
-- `SPARSE`：使用 CSR 格式存储
-- `DENSE`：使用二维 `vector` 存储
-
-CSR 结构：
-
-```cpp
-template<typename T>
-struct CSRMatrix {
-    int rows, cols;
-    std::vector<int> row_ptr;
-    std::vector<int> col_idx;
-    std::vector<T> values;
-};
-```
-
-特点：
-
-- 节省稀疏矩阵内存
-- 提高矩阵乘法效率
-- 支持动态插入与删除元素
-- 支持 CSR 与 Dense 自动切换
+每行只写自己的 C 行、互不依赖，所以最外层行循环可直接用 `#pragma omp parallel for` 并行，无数据竞争。
 
 ------
 
-## 2. 稀疏/稠密自动切换
+## 数学推导
 
-矩阵会根据密度自动切换存储模式：
+### 前向传播
 
-```cpp
-void checkModeSwitch()
-```
+每一层：
 
-切换逻辑：
+$$ H^{(l+1)} = \sigma!\left(\tilde{A}, H^{(l)} W^{(l)}\right),\qquad \tilde{A} = \hat{D}^{-\frac12}(A+I)\hat{D}^{-\frac12} $$
 
-- 密度较低 → 使用 CSR
-- 密度较高 → 使用 Dense
+其中 $H^{(0)}=X$，$\sigma$ 为 ReLU（末层取恒等以输出 logits）。实现上拆成两步：先稠密 GEMM 算 $XW$，再用 SpMM 左乘稀疏 $\tilde{A}$。
 
-这样可以兼顾：
+### 反向传播
 
-- 稀疏矩阵的存储效率
-- 稠密矩阵的计算效率
+设 $Z = \tilde{A}(XW)$，$M = XW$。给定上层回传的 $\partial \mathcal{L}/\partial H$：
 
-------
+$$ \delta_Z = \frac{\partial \mathcal{L}}{\partial H}\odot \sigma'(Z) $$ $$ \frac{\partial \mathcal{L}}{\partial M} = \tilde{A}^{\top}\delta_Z \quad(\text{SpMM}),\qquad \frac{\partial \mathcal{L}}{\partial W} = X^{\top}!\left(\tilde{A}^{\top}\delta_Z\right),\qquad \frac{\partial \mathcal{L}}{\partial X} = \left(\tilde{A}^{\top}\delta_Z\right) W^{\top} $$
 
-## 3. GCN 层实现
+（对称归一化下 $\tilde{A}^{\top}=\tilde{A}$，代码仍构造转置以保持对一般图的正确性。）
 
-GCN 的核心公式：
+### softmax + 交叉熵的合并梯度
 
-$$
-H = \sigma(\hat{A}XW)
-$$
+末层输出 logits，经行 softmax 得 $P$，masked 交叉熵对 logits 的梯度有简洁形式：
 
-
-其中：
-
-- `X`：节点特征矩阵
-- `W`：可训练权重矩阵
-- `Ĥ`：归一化邻接矩阵
-- `σ`：ReLU 激活函数
-
-前向传播：
-
-```cpp
-Z = adjHat * (X * weight);
-return outputH = relu(Z);
-```
-
-反向传播实现：
-
-- ReLU 梯度计算
-- 权重梯度计算
-- 输入梯度回传
+$$ \frac{\partial \mathcal{L}}{\partial Z_{\text{logits}}} = \frac{1}{|\text{mask}|},(P - \text{onehot}(y)),\quad \text{仅训练节点非零} $$
 
 ------
 
-## 4. 邻接矩阵归一化
+## 性能基准（`bench_spmm.cpp`）
 
-项目中实现了标准 GCN 的邻接矩阵归一化：
+单线程，`-O2`。Â 为 n×n 稀疏，X 为 n×64 稠密。（具体数字依机器而定，以下为一次实测。）
 
-$$
-\hat{A} = D^{-\frac{1}{2}}(A+I)D^{-\frac{1}{2}}
-$$
+**新 CSR-SpMM vs 旧实现的 set/get 累加：**
 
+| n    | density | 旧 (ms) | 新 (ms) | 加速 |
+| ---- | ------- | ------- | ------- | ---- |
+| 64   | 0.05    | 0.157   | 0.0071  | ~22× |
+| 256  | 0.05    | 1.363   | 0.118   | ~12× |
 
-作用：
+**新 CSR-SpMM vs 把 Â 当稠密做 GEMM：**
 
-- 避免节点度数差异过大
-- 提高训练稳定性
-- 防止特征尺度爆炸
+| n    | density | spmm (ms) | dense (ms) | 加速 |
+| ---- | ------- | --------- | ---------- | ---- |
+| 512  | 0.01    | 0.12      | 10.4       | ~87× |
+| 1024 | 0.01    | 0.42      | 33.2       | ~79× |
+| 2048 | 0.05    | 8.34      | 133.8      | ~16× |
 
-实现函数：
+关键结论：SpMM 开销随 nnz 增长、稠密 GEMM 随 n² 增长，所以**图越稀疏优势越大**。说明：此处稠密 baseline 是朴素三重循环而非优化过的 BLAS。
 
-```cpp
-normalizeAdjacency()
+### 多核扩展性（`bench_omp.cpp`）
+
+`-fopenmp` 编译后，行级并行的 SpMM 在多核机器上可进一步加速；并行结果与串行逐位一致。需要注意 SpMM 是**访存受限（memory-bound）**的——每个非零只做一次乘加却要拉取一整行——所以并行效率受内存带宽而非核数限制，通常前几个线程接近线性、之后饱和。
+
+|threads |   time(ms) |  speedup | efficiency|
+| ---- | ------- | --------- | ---------- |
+|      1 |    18.5059 |    1.00x |       100%|
+|      2 |    10.8692 |    1.70x |        85%|
+|      4 |     6.2577 |    2.96x |        74%|
+|      8 |     4.6131 |    4.01x |        50%|
+
+------
+
+## 正确性：数值梯度检验（`gradcheck.cpp`）
+
+用 `double` + 中心差分对照解析梯度：
+
+```
+W1  max relative error = 3.411e-09
+W2  max relative error = 3.657e-09
+-> PASS (反向传播正确)
 ```
 
 ------
 
-## 5. 激活函数
+## 训练与结果
 
-项目实现了：
+### Cora 节点分类（`train_cora.cpp`）
 
-### ReLU
+两层 GCN（hidden=16），AdamW（`lr=0.01, wd=5e-4`）+ Dropout 0.5，transductive 全图前向、仅在 train 掩码上回传。
 
-$$
-f(x)=\max(0,x)
-$$
-
-
-
-对应函数：
-
-```cpp
-relu()
-reluDerivative()
-```
-
-------
-
-## 6. 损失函数
-
-使用均方误差（MSE）：
-
-$$
-MSE = \frac{1}{nc}\sum_{i=1}^{n}\sum_{j=1}^{c}(y_{ij}-\hat{y}_{ij})^2
-$$
-
-
-实现函数：
-
-```cpp
-MSELoss()
-LossGrad()
-```
-
-------
-
-
-
-------
-
-# GCN 反向传播推导
-
-详细记录了图卷积网络（GCN）的反向传播（Backpropagation）推导过程。我们将从前向传播公式出发，利用链式法则推导权重的梯度更新公式。
-
-## 1. 前向传播
-
-GCN 的每一层可以表示为邻居节点特征的聚合与非线性变换。假设第 $l$ 层的输入为 $H^{(l)}$，权重矩阵为 $W^{(l)}$，归一化后的邻接矩阵为 $\tilde{A}$，则前向传播公式为：
-
-$$
-H^{(l+1)} = \sigma(\tilde{A} H^{(l)} W^{(l)})
-$$
-
-其中：
-
-- $H^{(0)} = X$ （输入特征矩阵）
-- $\sigma(\cdot)$ 为激活函数（如 ReLU）
-- $\tilde{A} = \hat{D}^{-\frac{1}{2}}\hat{A}\hat{D}^{-\frac{1}{2}}$ （对称归一化拉普拉斯矩阵，推导中视为常数）
-
-## 2. 损失函数
-
-我们使用均方误差（MSE）作为损失函数（也可推广至交叉熵）：
-
-$$
- E = \frac{1}{2} \sum_{k} (y_k - h_k)^2 = \frac{1}{2} | Y - H^{(L)} |_F^2 
-$$
-
-
-
-其中 $Y$ 是真实标签，$H^{(L)}$ 是网络输出。
-
-## 3. 反向传播推导
-
-我们的目标是计算损失函数 $E$ 对权重 $W^{(l)}$ 的梯度 $\frac{\partial E}{\partial W^{(l)}}$。
-
-### 3.1 输出层梯度
-
-首先定义输出层的误差项（Error Term）。令 $Z^{(l)} = \tilde{A} H^{(l)} W^{(l)}$ 为激活前的输入。
-
-对于输出层（假设为第 $n$ 层），其梯度计算如下：
-
-$$
-\frac{\partial E}{\partial W^{(n)}} = \frac{\partial E}{\partial Z^{(n)}} \cdot \frac{\partial Z^{(n)}}{\partial W^{(n)}}
-$$
-
-
-
-其中，输出层的误差项 $\delta^{(n)} = \frac{\partial E}{\partial Z^{(n)}}$ 可以展开为：
-
-$$
-\delta^{(n)} = \frac{\partial E}{\partial H^{(n)}} \odot \sigma'(Z^{(n)}) = (H^{(n)} - Y) \odot \sigma'(Z^{(n)}) 
-$$
-
-
-> **注意：** 此处 $\odot$ 表示哈达玛积（逐元素相乘）。
-
-### 3.2 隐藏层梯度 (链式法则)
-
-对于任意隐藏层 $l$，误差需要从后一层 $l+1$ 反向传播回来。根据链式法则：
-
-$$
-\frac{\partial E}{\partial H^{(l)}} = \frac{\partial E}{\partial Z^{(l+1)}} \cdot \frac{\partial Z^{(l+1)}}{\partial H^{(l)}} = (\delta^{(l+1)})^T \cdot \tilde{A} W^{(l+1)T}
-$$
-
-
-*注：这里涉及到矩阵求导的维度匹配，$\tilde{A}$ 和 $W$ 需要转置以保持维度一致。*
-
-因此，第 $l$ 层的误差项 $\delta^{(l)}$ 递推公式为：
-
-$$
-\delta^{(l)} = (\delta^{(l+1)} W^{(l+1)T} \tilde{A}^T) \odot \sigma'(Z^{(l)}) 
-$$
-
-
-### 3.3 权重更新公式
-
-一旦求得误差项 $\delta^{(l)}$，第 $l$ 层的权重梯度即可表示为：
-
-$$
-\nabla_{W^{(l)}} E = \frac{\partial E}{\partial W^{(l)}} = H^{(l)T} \tilde{A}^T \delta^{(l)}
-$$
-
-
-最终的权重更新（使用梯度下降）为：
-
-$$
-W^{(l)} \leftarrow W^{(l)} - \alpha \cdot (H^{(l)T} \tilde{A}^T \delta^{(l)}) 
-$$
-
-
-## 4. 总结公式
-
-为了便于编程实现，我们将上述推导总结为以下迭代步骤：
-
-1. **计算输出误差：** 
-
-$$
-\delta^{(L)} = (H^{(L)} - Y) \odot \sigma'(Z^{(L)}) 
-$$
-
-2. **反向传播误差 ($l = L-1, \dots, 1$)：** 
-
-$$
-\delta^{(l)} = (\delta^{(l+1)} W^{(l+1)T} \tilde{A}^T) \odot \sigma'(Z^{(l)}) 
-$$
-
-3. **计算梯度并更新：** 
-
-$$ 
-\frac{\partial E}{\partial W^{(l)}} = H^{(l)T} \tilde{A}^T \delta^{(l)} 
-$$ 
-
-$$ 
-W^{(l)} = W^{(l)} - \alpha \frac{\partial E}{\partial W^{(l)}} 
-$$
-
-## 5. 反向展示PPT可以看
-
-[GCN的反向传播](GCN的反向传播.pptx)
-
-
-
-------
-
-
-
-
-
-# 训练流程
-
-主程序训练过程：
-
-```text
-1. 初始化权重矩阵
-2. 随机生成图结构
-3. 随机生成节点特征
-4. 前向传播
-5. 计算损失
-6. 反向传播
-7. 更新参数
-8. 重复训练
-```
-
-训练代码入口：
-
-```cpp
-int main()
-```
-
-主要超参数：
-
-```cpp
-int max_epoch = 200;
-float learning_rate = 0.00005;
-```
-
-------
-
-# 编译与运行
-
-## 环境要求
-
-- C++11 及以上
-- g++ / clang++ / MSVC
-
-推荐：
-
-- GCC 11+
-- CLion / VSCode / Visual Studio
-
-------
-
-## Linux / MacOS
-
-编译：
+下载原始 LINQS 格式的 `cora.content` 与 `cora.cites`（GitHub 多有镜像）后：
 
 ```bash
-g++ main.cpp -o gcn -std=c++11
+g++ train_cora.cpp -o train -std=c++17 -O2
+./train cora.content cora.cites
 ```
 
-运行：
+不带参数则回退到合成数据集（无需下载即可验证管线）。预期测试准确率约 **78–82%**，与 GCN 原论文（81.5%）同量级。
+
+### 优化器对照（合成 Cora-like 数据，可复现）
+
+Cora 的特征是高维稀疏词袋、行归一化后量级极小，导致梯度过小、纯 SGD 几乎不动——这是 GCN 普遍使用 Adam 的原因。在同款 regime 的合成集上可清楚复现：
+
+| 优化器 | 学习率 | 200 epoch 后 train_loss | 测试准确率 |
+| ------ | ------ | ----------------------- | ---------- |
+| SGD    | 0.2    | 1.946 → 1.945（爬不动） | 0.29       |
+| AdamW  | 0.01   | 1.946 → 0.033           | 0.99       |
+
+（合成集干净可分，故达 ~99%；真实 Cora 噪声更大，约 80%。）
+
+------
+
+## 编译与运行
+
+环境：C++17，g++ / clang++。
 
 ```bash
-./gcn
+# 训练（Cora 或合成回退）
+g++ train_cora.cpp -o train     -std=c++17 -O2
+g++ train_cora.cpp -o train     -std=c++17 -O2 -fopenmp   # 启用并行 SpMM
+OMP_NUM_THREADS=8 ./train cora.content cora.cites
+
+# 梯度检验
+g++ gradcheck.cpp  -o gradcheck -std=c++17 -O2 && ./gradcheck
+
+# 性能基准
+g++ bench_spmm.cpp -o bench     -std=c++17 -O2 && ./bench
+g++ bench_omp.cpp  -o bench_omp -std=c++17 -O2 -fopenmp && ./bench_omp
 ```
 
-------
-
-## Windows（MinGW）
-
-```bash
-g++ main.cpp -o gcn.exe -std=c++11
-```
-
-运行：
-
-```bash
-gcn.exe
-```
+> 注意：需 **C++17**（`Tensor.h` / `Dataset.h` 使用了结构化绑定等特性）。
 
 ------
 
-# 示例输出
+## 实现要点
 
-```text
-epoch 0 : loss = 0.284321
-epoch 10 : loss = 0.197542
-epoch 20 : loss = 0.154873
-...
-```
+- **存储**：稠密用扁平 row-major 缓冲；稀疏用 CSR。两者为静态类型，无运行时密度切换。
+- **算子**：`matmul`（ikj 顺序，cache 友好）、`matmul_AtB` / `matmul_ABt`（避免显式转置）、`CSR::spmm`（AXPY kernel）、`CSR::transpose`。
+- **训练**：Xavier 初始化、AdamW、Inverted Dropout（缓存 mask 供反向）、masked 损失与准确率。
+- **可复现**：全局固定种子的 RNG。
 
-随着训练进行，Loss 会逐渐下降。
+## 局限与后续方向
 
-------
+- 当前为全图（full-batch）transductive 训练，未做 mini-batch / 邻居采样。
+- SpMM 仅 CPU + OpenMP，未做 SIMD 显式向量化或 CUDA。
+- 模型为标准两层 GCN，未实现 GAT / GraphSAGE 等变体。
 
-# 项目特点
+后续可扩展：CUDA SpMM、邻居采样的 mini-batch 训练、更多 GNN 变体。
 
-## 优点
+## 参考
 
-### 1. 从零实现
+- Kipf & Welling, *Semi-Supervised Classification with Graph Convolutional Networks* (ICLR 2017)
+- Cora 数据集（LINQS）
 
-未依赖任何深度学习框架：
+## 作者
 
-- 无 PyTorch
-- 无 TensorFlow
-- 无 Eigen
-
-更适合理解底层原理。
-
-------
-
-### 2. 支持 CSR 稀疏矩阵
-
-相比普通二维数组：
-
-- 更节省空间
-- 更适合图结构数据
-- 更符合真实 GNN 场景
-
-------
-
-### 3. 自动存储模式切换
-
-实现了：
-
-- Sparse ↔ Dense 动态切换
-- 自动根据矩阵密度优化
-
-------
-
-### 4. 包含完整训练流程
-
-实现了：
-
-- Forward
-- Backward
-- Gradient
-- Weight Update
-
-具备完整神经网络训练结构。
-
-------
-
-# 项目不足
-
-当前项目仍属于教学级实现，存在一些限制：
-
-- 使用随机生成数据，而非真实图数据集
-- 未实现 Batch 训练
-- 未实现 GPU 加速
-- 未实现 Adam 优化器
-- 未实现多层复杂 GNN 结构
-- CSR 运算仍有进一步优化空间
-
-------
-
-# 可扩展方向
-
-后续可以继续扩展：
-
-## 图神经网络方向
-
-- GAT（Graph Attention Network）
-- GraphSAGE
-- GIN
-- RGCN
-
-## 工程优化方向
-
-- OpenMP 并行化
-- CUDA GPU 加速
-- SIMD 优化
-- 更高效 CSR SpMM
-
-## 深度学习方向
-
-- Adam / RMSProp
-- Dropout
-- BatchNorm
-- 残差连接
-
-------
-
-# 学习收获
-
-通过本实验，可以深入理解：
-
-- 图卷积的数学原理
-- 稀疏矩阵存储结构
-- 神经网络反向传播
-- 深度学习框架底层机制
-- C++ 模板与矩阵运算实现
-
-相比直接调用深度学习框架，本项目更加注重：
-
-- 底层实现
-- 数据结构设计
-- 数学推导理解
-- 算法实现能力
-
-------
-
-# 参考资料
-
-## GCN 论文
-
-Thomas Kipf & Max Welling:
-
-> Semi-Supervised Classification with Graph Convolutional Networks
-
-------
-
-## 推荐学习资料
-
-- CS231n
-- Stanford GNN Course
-- PyTorch Geometric
-- Deep Learning（Ian Goodfellow）
-- 图神经网络：基础与前沿
-
-------
-
-# 作者
-
-- 聂宇航
-- 学号：23170001072
-
-------
-
-# License
-
-本项目仅用于学习与课程实验。
+聂宇航
