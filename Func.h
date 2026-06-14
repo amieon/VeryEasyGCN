@@ -89,3 +89,67 @@ CSR<T> build_normalized_adj(int n, const std::vector<std::pair<int,int>>& edges)
             trips.emplace_back(i, j, inv_sqrt_deg[i] * inv_sqrt_deg[j]);
     return CSR<T>::from_sorted_triplets(n, n, trips);
 }
+
+// ===========================================================================
+// Phase 3：分类相关算子（softmax / 交叉熵 / masked 准确率）
+// ===========================================================================
+
+// 行 softmax（数值稳定：每行减去最大值）
+template<typename T>
+DenseMatrix<T> softmax_rows(const DenseMatrix<T>& Z) {
+    DenseMatrix<T> P(Z.rows, Z.cols);
+    for (int i = 0; i < Z.rows; ++i) {
+        const T* z = Z.row_ptr(i);
+        T* p = P.row_ptr(i);
+        T mx = z[0];
+        for (int j = 1; j < Z.cols; ++j) mx = std::max(mx, z[j]);
+        T sum = T(0);
+        for (int j = 0; j < Z.cols; ++j) { p[j] = std::exp(z[j] - mx); sum += p[j]; }
+        for (int j = 0; j < Z.cols; ++j) p[j] /= sum;
+    }
+    return P;
+}
+
+// masked 交叉熵： L = -1/|mask| Σ_{i∈mask} log P[i, y_i]
+template<typename T>
+T cross_entropy_masked(const DenseMatrix<T>& P, const std::vector<int>& y,
+                       const std::vector<char>& mask) {
+    T loss = T(0); int cnt = 0;
+    for (int i = 0; i < P.rows; ++i)
+        if (mask[i]) {
+            loss += -std::log(std::max(P(i, y[i]), T(1e-12)));
+            ++cnt;
+        }
+    return cnt ? loss / T(cnt) : T(0);
+}
+
+// softmax + CE 的合并梯度（对 logits）： (P - onehot)/|mask|，mask 外为 0
+template<typename T>
+DenseMatrix<T> softmax_ce_grad(const DenseMatrix<T>& P, const std::vector<int>& y,
+                               const std::vector<char>& mask) {
+    DenseMatrix<T> g(P.rows, P.cols);
+    int cnt = 0;
+    for (int i = 0; i < P.rows; ++i) if (mask[i]) ++cnt;
+    if (!cnt) return g;
+    for (int i = 0; i < P.rows; ++i)
+        if (mask[i]) {
+            for (int c = 0; c < P.cols; ++c) g(i, c) = P(i, c) / T(cnt);
+            g(i, y[i]) -= T(1) / T(cnt);
+        }
+    return g;
+}
+
+// masked 准确率
+template<typename T>
+double accuracy_masked(const DenseMatrix<T>& logits, const std::vector<int>& y,
+                       const std::vector<char>& mask) {
+    int correct = 0, total = 0;
+    for (int i = 0; i < logits.rows; ++i)
+        if (mask[i]) {
+            const T* z = logits.row_ptr(i);
+            int arg = 0;
+            for (int c = 1; c < logits.cols; ++c) if (z[c] > z[arg]) arg = c;
+            correct += (arg == y[i]); ++total;
+        }
+    return total ? double(correct) / total : 0.0;
+}
