@@ -1,50 +1,41 @@
 #pragma once
-#include "Matrix.h"
+#include "Tensor.h"
 #include "Func.h"
 
 template<typename T>
 class GCNLayer {
 public:
-    Matrix<T> weight;      // 参数 W
-    Matrix<T> gradWeight;  // W 的梯度
-    Matrix<T> adjHat;      // 归一化邻接矩阵
+    DenseMatrix<T> weight;      // 参数 W
+    DenseMatrix<T> gradWeight;  // dL/dW
+    CSR<T> adjHat;              // 归一化邻接 Â（稀疏）
+    CSR<T> adjHatT;             // Â^T（反向用；对称图下 == Â）
 
-    // 前向缓存（用于反向传播）
-    Matrix<T> inputX;      // 输入 X
-    Matrix<T> Z;           // 激活前 Z = Ĥ X W
-    Matrix<T> outputH;     // 激活后 H = σ(Z)
+    // 前向缓存
+    DenseMatrix<T> inputX, Z, outputH;
 
+    GCNLayer() = default;
+    explicit GCNLayer(const DenseMatrix<T>& W)
+        : weight(W), gradWeight(W.rows, W.cols) {}
 
-    GCNLayer(const Matrix<T>& W_init, const Matrix<T>& adj)
-            : weight(W_init),
-              gradWeight(W_init.rows, W_init.cols),
-              adjHat(normalizeAdjacency(adj)),
-              inputX(),
-              Z(),
-              outputH()
-    {}
+    void set_adj(const CSR<T>& a) { adjHat = a; adjHatT = a.transpose(); }
 
-
-    Matrix<T> forward(const Matrix<T>& X) {
+    // 前向: Z = Â (X W),  H = relu(Z)
+    DenseMatrix<T> forward(const DenseMatrix<T>& X) {
         inputX = X;
-        Z = adjHat * (X * weight);  // Z = Ĥ X W
-        return outputH = relu(Z);
+        DenseMatrix<T> XW = matmul(X, weight);  // 稠密 GEMM
+        Z = adjHat.spmm(XW);                    // SpMM：稀疏 Â × 稠密
+        outputH = relu(Z);
+        return outputH;
     }
 
-    // 反向传播：给定上层传下来的 dL/dH，返回 dL/dX
-    Matrix<T> backward(const Matrix<T>& dLoss_dH) {
-        Matrix<T> dZ = dLoss_dH % reluDerivative(Z);
-        Matrix<T> dZ_adj = adjHat.transpose() * dZ;
-        gradWeight = inputX.transpose() * dZ_adj;
-
-        Matrix<T> dX = dZ_adj * weight.transpose();
-
+    // 反向: 输入 dL/dH，返回 dL/dX
+    DenseMatrix<T> backward(const DenseMatrix<T>& dH) {
+        DenseMatrix<T> dZ = hadamard(dH, relu_deriv(Z));  // ⊙ σ'(Z)
+        DenseMatrix<T> dM = adjHatT.spmm(dZ);             // dM = Â^T dZ
+        gradWeight = matmul_AtB(inputX, dM);              // dW = X^T dM
+        DenseMatrix<T> dX = matmul_ABt(dM, weight);       // dX = dM W^T
         return dX;
     }
 
-
-    void updateWeights(T lr) {
-        weight = weight - gradWeight * lr;
-    }
-
+    void updateWeights(T lr) { axpy_update(weight, gradWeight, lr); }
 };

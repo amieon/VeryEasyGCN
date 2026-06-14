@@ -5,81 +5,56 @@
 
 using namespace std;
 
-// ---------------------------------------------------------------------------
-// teacher–student 健全性检验
-//   固定一个 "教师" 2 层 GCN，对每个图生成标签 Y = teacher(Â, X)。
-//   学生网络从随机初始化开始拟合。因为目标在同一架构下是可表示的，
-//   只要前向 / 反向 / 参数更新都正确，loss 就应当稳定下降并逼近 0。
-// ---------------------------------------------------------------------------
-
+// Phase 2：teacher–student 训练，跑在重写后的核心上（验证算子改写未破坏训练）
 int main() {
-    const int N        = 16;   // 数据集中的图数量
-    const int n        = 12;   // 每个图的节点数
-    const int F_in     = 8;    // 输入特征维度
-    const int F_hidden = 16;   // 隐藏维度
-    const int F_out    = 4;    // 输出维度
-    const int max_epoch     = 300;
-    const float learning_rate = 0.05f;
-
+    const int N = 16, n = 12, F_in = 8, F_hidden = 16, F_out = 4;
+    const int max_epoch = 300;
+    const float lr = 0.05f;
     seed_rng(42);
 
-    // ---- 教师权重（固定，用来生成标签）----
-    Matrix<float> tW1(F_in, F_hidden), tW2(F_hidden, F_out);
+    // 教师权重（固定）
+    DenseMatrix<float> tW1(F_in, F_hidden), tW2(F_hidden, F_out);
     init_xavier(tW1); init_xavier(tW2);
 
-    // ---- 数据集：每个图有自己的邻接、特征，以及教师生成的标签 ----
-    vector<Matrix<float>> Ahat(N), X(N), Y(N);
+    // 数据集：每图的 Â、X，以及教师生成的 Y
+    vector<CSR<float>> Ahat(N);
+    vector<DenseMatrix<float>> X(N), Y(N);
     {
-        Matrix<float> dummy(n, n);  // 仅用于构造教师层
-        GCNLayer<float> teacher1(tW1, dummy), teacher2(tW2, dummy);
+        GCNLayer<float> t1(tW1), t2(tW2);
         for (int i = 0; i < N; ++i) {
-            Matrix<float> A(n, n);
-            make_symmetric_adj(A, 0.3);
-            Ahat[i] = normalizeAdjacency(A);
-
-            X[i] = Matrix<float>(n, F_in);
+            auto edges = random_symmetric_edges(n, 0.3);
+            Ahat[i] = build_normalized_adj<float>(n, edges);
+            X[i] = DenseMatrix<float>(n, F_in);
             init_gaussian(X[i]);
-
-            teacher1.adjHat = Ahat[i];
-            teacher2.adjHat = Ahat[i];
-            Matrix<float> h = teacher1.forward(X[i]);
-            Y[i] = teacher2.forward(h);
+            t1.set_adj(Ahat[i]); t2.set_adj(Ahat[i]);
+            Y[i] = t2.forward(t1.forward(X[i]));
         }
     }
 
-    // ---- 学生网络（随机初始化，待训练）----
-    Matrix<float> sW1(F_in, F_hidden), sW2(F_hidden, F_out);
+    // 学生网络
+    DenseMatrix<float> sW1(F_in, F_hidden), sW2(F_hidden, F_out);
     init_xavier(sW1); init_xavier(sW2);
-    Matrix<float> dummy(n, n);
-    GCNLayer<float> layer1(sW1, dummy), layer2(sW2, dummy);
+    GCNLayer<float> layer1(sW1), layer2(sW2);
 
-    vector<float> loss_curve;
-    loss_curve.reserve(max_epoch);
-
+    vector<float> curve;
+    curve.reserve(max_epoch);
     for (int epoch = 0; epoch < max_epoch; ++epoch) {
-        float epoch_loss = 0.0f;
+        float epoch_loss = 0.f;
         for (int i = 0; i < N; ++i) {
-            layer1.adjHat = Ahat[i];
-            layer2.adjHat = Ahat[i];
-
-            Matrix<float> out = layer1.forward(X[i]);
-            out = layer2.forward(out);
-
-            epoch_loss += MSELoss(out, Y[i]).get(0, 0);
-
-            Matrix<float> dOut = LossGrad(out, Y[i]);
+            layer1.set_adj(Ahat[i]); layer2.set_adj(Ahat[i]);
+            DenseMatrix<float> out = layer2.forward(layer1.forward(X[i]));
+            epoch_loss += MSELoss(out, Y[i]);
+            DenseMatrix<float> dOut = LossGrad(out, Y[i]);
             layer1.backward(layer2.backward(dOut));
-            layer1.updateWeights(learning_rate);
-            layer2.updateWeights(learning_rate);
+            layer1.updateWeights(lr);
+            layer2.updateWeights(lr);
         }
-        loss_curve.push_back(epoch_loss / N);  // 每个 epoch 一个平均 loss
+        curve.push_back(epoch_loss / N);
     }
 
-    // ---- 正确地打印每个 epoch 的平均 loss ----
     printf("epoch | avg MSE loss\n");
-    for (int epoch = 0; epoch < max_epoch; ++epoch)
-        if (epoch % 20 == 0 || epoch == max_epoch - 1)
-            printf("%5d | %.6f\n", epoch, loss_curve[epoch]);
-
+    for (int e = 0; e < max_epoch; ++e)
+        if (e % 20 == 0 || e == max_epoch - 1)
+            printf("%5d | %.6f\n", e, curve[e]);
     return 0;
 }
