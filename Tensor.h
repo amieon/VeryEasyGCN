@@ -4,6 +4,19 @@
 #include <cstddef>
 #include <utility>
 
+// ===========================================================================
+// Phase 2 重写说明
+//   原 Matrix.h 的问题：
+//     · dense_data 是 vector<vector<T>>，非连续、指针追逐、cache 不友好
+//     · "自动稀疏/稠密切换" 在每次 set 时触发，且切换本身 O(rows*cols)
+//     · GCN 真正用到的 SpMM（稀疏 Â × 稠密 X）走的是 result.set/get 累加，
+//       每次累加 O(行内非零 + rows)，把 SpMM 写成了远比稠密更慢的负优化
+//   重写思路：
+//     · DenseMatrix：单块连续 std::vector<T>，row-major，所有 GEMM 走指针
+//     · CSR：真正的压缩稀疏行，spmm() 按非零做 AXPY（教科书写法）
+//     · GCN 里 Â 恒稀疏、X/W/H 恒稠密，类型静态已知 —— 不需要动态切换
+// ===========================================================================
+
 template<typename T>
 struct DenseMatrix {
     int rows = 0, cols = 0;
@@ -19,8 +32,10 @@ struct DenseMatrix {
     inline const T* row_ptr(int i) const { return &data[(size_t)i * cols]; }
 };
 
-
+// ---------------------------------------------------------------------------
 // 稠密运算（自由函数，便于内联与后续并行/向量化）
+// ---------------------------------------------------------------------------
+
 // C = A * B   (ikj 顺序：对 B 的行做连续 AXPY，cache 友好)
 template<typename T>
 DenseMatrix<T> matmul(const DenseMatrix<T>& A, const DenseMatrix<T>& B) {
@@ -97,8 +112,9 @@ void axpy_update(DenseMatrix<T>& A, const DenseMatrix<T>& G, T lr) {
         A.data[i] -= lr * G.data[i];
 }
 
-
-// CSR 稀疏矩阵
+// ---------------------------------------------------------------------------
+// CSR 稀疏矩阵：真正的压缩稀疏行
+// ---------------------------------------------------------------------------
 template<typename T>
 struct CSR {
     int rows = 0, cols = 0;
@@ -118,6 +134,9 @@ struct CSR {
         assert(cols == B.rows);
         const int N = B.cols;
         DenseMatrix<T> C(rows, N);
+        // 行级并行：每行独占写 C 的一行，无数据竞争。
+        // 未启用 -fopenmp 时此 pragma 被忽略，退化为串行。
+        #pragma omp parallel for schedule(static)
         for (int i = 0; i < rows; ++i) {
             T* crow = C.row_ptr(i);
             for (int idx = row_ptr[i]; idx < row_ptr[i + 1]; ++idx) {
