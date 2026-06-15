@@ -3,19 +3,10 @@
 #include <cassert>
 #include <cstddef>
 #include <utility>
+#include <cstdlib>
+#include <immintrin.h>
 
-// ===========================================================================
-// Phase 2 重写说明
-//   原 Matrix.h 的问题：
-//     · dense_data 是 vector<vector<T>>，非连续、指针追逐、cache 不友好
-//     · "自动稀疏/稠密切换" 在每次 set 时触发，且切换本身 O(rows*cols)
-//     · GCN 真正用到的 SpMM（稀疏 Â × 稠密 X）走的是 result.set/get 累加，
-//       每次累加 O(行内非零 + rows)，把 SpMM 写成了远比稠密更慢的负优化
-//   重写思路：
-//     · DenseMatrix：单块连续 std::vector<T>，row-major，所有 GEMM 走指针
-//     · CSR：真正的压缩稀疏行，spmm() 按非零做 AXPY（教科书写法）
-//     · GCN 里 Â 恒稀疏、X/W/H 恒稠密，类型静态已知 —— 不需要动态切换
-// ===========================================================================
+
 
 template<typename T>
 struct DenseMatrix {
@@ -32,10 +23,46 @@ struct DenseMatrix {
     inline const T* row_ptr(int i) const { return &data[(size_t)i * cols]; }
 };
 
-// ---------------------------------------------------------------------------
-// 稠密运算（自由函数，便于内联与后续并行/向量化）
-// ---------------------------------------------------------------------------
+template<typename T>
+void AVX_mul(T* crow, T a, const T*brow, int N){
+#ifdef USE_AVX
+    if constexpr (std::is_same_v<T, float>){
+        int j = 0;
+        __m256 scale = _mm256_set1_ps(a);
+        for(; j <= N - 8;j += 8){
+            __m256 vec = _mm256_loadu_ps(brow + j);
+            __m256 result = _mm256_mul_ps(vec, scale);
 
+            __m256 original = _mm256_loadu_ps(crow + j);
+            __m256 new_val = _mm256_add_ps(original, result);
+            _mm256_storeu_ps(crow + j, new_val);
+        }
+        for (; j < N; ++j)
+            crow[j] += a * brow[j];
+    }
+    else if constexpr (std::is_same_v<T, double>) {
+        int j = 0;
+        __m256d scale = _mm256_set1_pd(a);
+        for(; j <= N - 4;j += 4){
+            __m256d vec = _mm256_loadu_pd(brow + j);
+            __m256d result = _mm256_mul_pd(vec, scale);
+
+            __m256d original = _mm256_loadu_pd(crow + j);
+            __m256d new_val = _mm256_add_pd(original, result);
+            _mm256_storeu_pd(crow + j, new_val);
+        }
+        for (; j < N; ++j)
+            crow[j] += a * brow[j];
+    }
+    else {
+        for (int j = 0; j < N; ++j)
+            crow[j] += a * brow[j];
+    }
+#else
+    for (int j = 0; j < N; ++j)
+        crow[j] += a * brow[j];
+#endif
+}
 // C = A * B   (ikj 顺序：对 B 的行做连续 AXPY，cache 友好)
 template<typename T>
 DenseMatrix<T> matmul(const DenseMatrix<T>& A, const DenseMatrix<T>& B) {
@@ -48,8 +75,7 @@ DenseMatrix<T> matmul(const DenseMatrix<T>& A, const DenseMatrix<T>& B) {
         for (int k = 0; k < K; ++k) {
             const T a = arow[k];
             const T* brow = B.row_ptr(k);
-            for (int j = 0; j < N; ++j)
-                crow[j] += a * brow[j];
+            AVX_mul(crow,a,brow,N);
         }
     }
     return C;
@@ -67,8 +93,7 @@ DenseMatrix<T> matmul_AtB(const DenseMatrix<T>& A, const DenseMatrix<T>& B) {
         for (int i = 0; i < P; ++i) {
             const T a = arow[i];
             T* crow = C.row_ptr(i);
-            for (int j = 0; j < N; ++j)
-                crow[j] += a * brow[j];
+            AVX_mul(crow,a,brow,N);
         }
     }
     return C;
@@ -86,9 +111,52 @@ DenseMatrix<T> matmul_ABt(const DenseMatrix<T>& A, const DenseMatrix<T>& B) {
         for (int j = 0; j < N; ++j) {
             const T* brow = B.row_ptr(j);
             T s = T{};
+#ifdef USE_AVX
+            if constexpr (std::is_same_v<T, float>){
+                __m256 sum_vec = _mm256_setzero_ps();
+                int l = 0;
+                for(; l <= K - 8;l += 8){
+                    __m256 vec_a = _mm256_loadu_ps(arow + l);
+                    __m256 vec_b = _mm256_loadu_ps(brow + l);
+                    __m256 result = _mm256_mul_ps(vec_a, vec_b);
+                    sum_vec = _mm256_add_ps(sum_vec, result);
+                }
+                T sum[8];
+                _mm256_storeu_ps(sum, sum_vec);
+                for (int p = 0; p < 8; ++p) s += sum[p];
+                for (; l < K; ++l)
+                    s += arow[l] * brow[l];
+                crow[j] = s;
+            }
+            else if constexpr (std::is_same_v<T, double>) {
+                __m256d sum_vec = _mm256_setzero_pd();
+                int l = 0;
+                for(; l <= K - 4;l += 4){
+                    __m256d vec_a = _mm256_loadu_pd(arow + l);
+                    __m256d vec_b = _mm256_loadu_pd(brow + l);
+                    __m256d result = _mm256_mul_pd(vec_a, vec_b);
+                    sum_vec = _mm256_add_pd(sum_vec, result);
+
+                }
+                T sum[8];
+                _mm256_storeu_pd(sum, sum_vec);
+                for (int p = 0; p < 4; ++p) s += sum[p];
+                for (; l < K; ++l)
+                    s += arow[l] * brow[l];
+                crow[j] = s;
+            }
+            else {
+                for (int l = 0; l < K; ++l)
+                    s += arow[l] * brow[l];
+                crow[j] = s;
+            }
+#else
             for (int l = 0; l < K; ++l)
                 s += arow[l] * brow[l];
             crow[j] = s;
+#endif
+
+
         }
     }
     return C;
@@ -142,8 +210,7 @@ struct CSR {
             for (int idx = row_ptr[i]; idx < row_ptr[i + 1]; ++idx) {
                 const T a = values[idx];
                 const T* brow = B.row_ptr(col_idx[idx]);
-                for (int j = 0; j < N; ++j)
-                    crow[j] += a * brow[j];
+                AVX_mul(crow,a,brow,N);
             }
         }
         return C;
