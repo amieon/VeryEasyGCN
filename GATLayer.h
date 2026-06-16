@@ -93,5 +93,9 @@ public:
         return matmul_ABt(dZ, weight);
     }
 
-    void updateWeights(T lr) { axpy_update(weight, gradWeight, lr); }
+    void updateWeights(T lr) {
+        axpy_update(weight, gradWeight, lr);
+        axpy_update(alpha_src, dalpha_src, lr);
+        axpy_update(alpha_dst, dalpha_dst, lr);
+    }
 };
