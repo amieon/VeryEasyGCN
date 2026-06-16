@@ -93,13 +93,16 @@ $$ \frac{\partial \mathcal{L}}{\partial Z_{\text{logits}}} = \frac{1}{|\text{mas
 ## GAT：图注意力网络
 
 GCN 的聚合权重 $\tilde{A}$ 是写死的（只看度数）；GAT 让模型从节点特征学出每个邻居的重要性 $\alpha_{ij}$。
-
+---
 **前向**：
 
 1. 线性变换 $z_i = W h_i$
-2. 注意力分数 $e_{ij} = \text{LeakyReLU}(\vec{a}_{\text{src}}^{\top} z_i + \vec{a}_{\text{dst}}^{\top} z_j)$ —— 利用 $\vec{a}=[\vec{a}_{\text{src}} \Vert \vec{a}_{\text{dst}}]$ 的线性可加性，把拼接内积拆成两个 $O(nF')$ 的矩阵-向量乘 + 逐边相加，避免 $O(n^2)$ 枚举与显式拼接
+
+2. 注意力分数 $`e_{ij} = \text{LeakyReLU}(\vec{a}_{\text{src}}^{\top} z_i + \vec{a}_{\text{dst}}^{\top} z_j)`$ —— 利用 $`\vec{a}=[\vec{a}_{\text{src}} \Vert \vec{a}_{\text{dst}}]`$ 的线性可加性，把拼接内积拆成两个 $O(nF')$ 的矩阵-向量乘 + 逐边相加，避免 $O(n^2)$ 枚举与显式拼接
+
 3. **segment softmax**：在每个节点的邻居集合内归一化（按 CSR 行分段）
-4. 聚合 $h_i' = \sigma!\left(\sum_{j \in N(i)} \alpha_{ij} z_j\right)$ —— 即以 $\alpha$ 为值的 SpMM
+
+4. 聚合 $h_i' = \sigma(\sum_{j \in N(i)} \alpha_{ij} z_j)$ —— 即以 $\alpha$ 为值的 SpMM
 
 **反向**完整实现：SDDMM 在边上算 $d\alpha_{ij}=\langle dZ_{\text{out}}[i],, z_j\rangle$（避免物化 $n\times n$）→ segment softmax 反向 → LeakyReLU → 梯度散射回 src/dst（行求和 / 借转置做列求和）→ $z$ 的**三路梯度汇合**（聚合链 + src 链 + dst 链）。
 
