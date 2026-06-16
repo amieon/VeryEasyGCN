@@ -90,13 +90,11 @@ CSR<T> build_normalized_adj(int n, const std::vector<std::pair<int,int>>& edges)
     return CSR<T>::from_sorted_triplets(n, n, trips);
 }
 
-// ===========================================================================
-// Phase 3：分类相关算子（softmax / 交叉熵 / masked 准确率）
-// ===========================================================================
+
 
 // 行 softmax（数值稳定：每行减去最大值）
 template<typename T>
-DenseMatrix<T> softmax_rows(const DenseMatrix<T>& Z) {
+DenseMatrix<T> segment_softmax (const DenseMatrix<T>& Z) {
     DenseMatrix<T> P(Z.rows, Z.cols);
     for (int i = 0; i < Z.rows; ++i) {
         const T* z = Z.row_ptr(i);
@@ -106,6 +104,31 @@ DenseMatrix<T> softmax_rows(const DenseMatrix<T>& Z) {
         T sum = T(0);
         for (int j = 0; j < Z.cols; ++j) { p[j] = std::exp(z[j] - mx); sum += p[j]; }
         for (int j = 0; j < Z.cols; ++j) p[j] /= sum;
+    }
+    return P;
+}
+
+// 行 softmax（数值稳定：每行减去最大值）
+template<typename T>
+CSR<T> sparse_softmax(const CSR<T>& Z) {
+    CSR<T> P = Z;
+    const int* row_ptr = Z.row_ptr.data();  // 原始指针避免 vector 开销
+    const T* z_vals = Z.values.data();
+    T* p_vals = P.values.data();
+
+    for (int i = 0; i < Z.rows; ++i) {
+        int start = row_ptr[i], end = row_ptr[i + 1];   // ← 这一段就是节点 i 的邻居
+        if (start == end) continue;                      // 没有邻居，跳过
+
+        // 1. 找这一段的最大值（数值稳定，和你 Dense 版一个道理）
+        T mx = z_vals[start];
+        for (int j = start; j < end; ++j) mx = std::max(mx, z_vals[j]);
+        // 2. 每个 P[idx] -> exp(Z[idx] - max)，同时累加 sum
+        T sum = T(0);
+        for (int j = start; j < end; ++j) { p_vals[j] = std::exp(z_vals[j] - mx); sum += p_vals[j]; }
+        // 3. 每个 P[idx] /= sum
+        for (int j = start; j < end; ++j) p_vals[j] /= sum;
+        // —— 三个循环都是 for (idx = start; idx < end; ++idx)
     }
     return P;
 }
@@ -154,11 +177,7 @@ double accuracy_masked(const DenseMatrix<T>& logits, const std::vector<int>& y,
     return total ? double(correct) / total : 0.0;
 }
 
-// ===========================================================================
-// Phase 4：Inverted Dropout
-//   训练时按概率 p 置零，保留的元素乘 1/(1-p)（保持期望不变）；
-//   缓存 mask，反向用同一 mask 缩放梯度。推理时为恒等。
-// ===========================================================================
+
 template<typename T>
 struct Dropout {
     T p;

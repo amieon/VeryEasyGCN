@@ -28,7 +28,7 @@ void train(Graph<T>& g, int hidden, int epochs, T lr, T wd, bool use_adam, T dro
         DenseMatrix<T> h  = L1.forward(Xd);
         DenseMatrix<T> hd = dhid.forward(h, true);
         DenseMatrix<T> logits = L2.forward(hd);
-        DenseMatrix<T> P = softmax_rows(logits);
+        DenseMatrix<T> P = segment_softmax (logits);
 
         T loss = cross_entropy_masked(P, g.labels, g.train_mask);
         DenseMatrix<T> dlogits = softmax_ce_grad(P, g.labels, g.train_mask);
