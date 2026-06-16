@@ -23,6 +23,28 @@ struct DenseMatrix {
     inline const T* row_ptr(int i) const { return &data[(size_t)i * cols]; }
 };
 
+
+template<typename T>
+DenseMatrix<T>& operator+=(DenseMatrix<T>& lhs, const DenseMatrix<T>& rhs) {
+    assert (!(lhs.rows != rhs.rows || lhs.cols != rhs.cols)) ;
+    T* ldata = lhs.data.data();
+    const T* rdata = rhs.data.data();
+    const size_t n = lhs.data.size();  // 总元素个数
+    for (size_t i = 0; i < n; ++i) {
+        ldata[i] += rdata[i];
+    }
+    return lhs;
+
+}
+
+
+template<typename T>
+DenseMatrix<T> operator+(const DenseMatrix<T>& lhs, const DenseMatrix<T>& rhs) {
+    DenseMatrix<T> result = lhs;   // 拷贝构造
+    result += rhs;                 // 复用 +=
+    return result;                 // NRVO/移动语义优化
+}
+
 template<typename T>
 void AVX_mul(T* crow, T a, const T*brow, int N){
 #ifdef USE_AVX
@@ -171,6 +193,8 @@ DenseMatrix<T> hadamard(const DenseMatrix<T>& A, const DenseMatrix<T>& B) {
         C.data[i] = A.data[i] * B.data[i];
     return C;
 }
+
+
 
 // A <- A - lr * G   (原地更新，避免重新分配)
 template<typename T>
